@@ -1,0 +1,373 @@
+from __future__ import annotations
+
+import threading
+import time
+from datetime import datetime
+from typing import Any
+
+from gi.repository import Gdk, GLib, Gtk
+
+from ..config import ConfigStore
+from ..core.adb_client import AdbClient, AdbError
+from ..core.scrcpy_client import ScrcpyClient
+from ..core.session_manager import SleepTimeoutGuard
+from ..core.window_geometry import X11GeometryController
+from ..models import AdbDevice, AppConfig, DeviceKind, PhoneProfile, QUALITY_PROFILES, ScrcpyCapabilities
+
+
+class MainWindow(Gtk.ApplicationWindow):
+    def __init__(self, app: Gtk.Application, store: ConfigStore) -> None:
+        super().__init__(application=app, title="Telechipo")
+        self.store, self.config = store, store.load()
+        # Keep the controller intentionally tiny; the native scrcpy window is separate.
+        self.set_default_size(470, 440)
+        self.devices: list[AdbDevice] = []
+        self.selected_serial: str | None = None
+        self.caps = ScrcpyCapabilities()
+        self._closing = False
+        self._scrcpy_geometry_capture_running = False
+        self._ignore_scrcpy_geometry = False
+        self._switching_profile = False
+        self.geometry = X11GeometryController()
+        self.adb = AdbClient(lambda text: self.log("INFO", text))
+        self.scrcpy = ScrcpyClient(lambda line: GLib.idle_add(self.log, "INFO", line), lambda code: GLib.idle_add(self._scrcpy_exited, code))
+        self.guard = SleepTimeoutGuard(self.adb, log=lambda text: self.log("WARNING", text))
+        self._build()
+        self.connect("close-request", self._on_close)
+        self._run_async(self._initialize)
+
+    def _build(self) -> None:
+        self._install_css()
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        root.set_margin_top(6); root.set_margin_bottom(6); root.set_margin_start(6); root.set_margin_end(6)
+        self.set_child(root)
+
+        header = Gtk.Box(spacing=6)
+        self.title_label = Gtk.Label(label=self.config.phone_name); self.title_label.add_css_class("heading"); self.title_label.set_hexpand(True); self.title_label.set_xalign(0)
+        self.status = Gtk.Label(label="● Non détecté"); self.status.add_css_class("dim-label")
+        refresh = Gtk.Button(label="Actualiser"); refresh.connect("clicked", lambda _b: self.refresh())
+        header.append(self.title_label); header.append(self.status); header.append(refresh); root.append(header)
+
+        tabs = Gtk.Notebook(); tabs.set_vexpand(True); root.append(tabs)
+        connection = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5); connection.set_margin_top(6); connection.set_margin_bottom(4); connection.set_margin_start(6); connection.set_margin_end(6)
+        tabs.append_page(connection, Gtk.Label(label="Connexion"))
+        grid = Gtk.Grid(column_spacing=6, row_spacing=4); connection.append(grid)
+        profile_row = Gtk.Box(spacing=4)
+        self.phone_profiles = Gtk.DropDown.new_from_strings([profile.phone_name for profile in self.config.profiles]); profile_row.append(self.phone_profiles)
+        self.phone_profiles.set_hexpand(True)
+        add_profile = Gtk.Button(label="+"); add_profile.set_tooltip_text("Nouveau téléphone"); add_profile.connect("clicked", self._new_phone_profile)
+        remove_profile = Gtk.Button(label="−"); remove_profile.set_tooltip_text("Supprimer ce profil"); remove_profile.connect("clicked", self._delete_phone_profile)
+        profile_row.append(add_profile); profile_row.append(remove_profile)
+        self.name = self._entry(self.config.phone_name); self.ip = self._entry(self.config.ip_address)
+        self.port = Gtk.SpinButton.new_with_range(1, 65535, 1); self.port.set_value(self.config.port)
+        self.mode = Gtk.DropDown.new_from_strings(["Automatique", "Wi-Fi", "USB"]); self._select_text(self.mode, ["Automatique", "Wi-Fi", "USB"], self.config.preferred_mode)
+        for row, (label, widget) in enumerate((("Téléphone", profile_row), ("Nom", self.name), ("Adresse IP", self.ip), ("Port", self.port), ("Mode préféré", self.mode))):
+            lab = Gtk.Label(label=label, xalign=0); grid.attach(lab, 0, row, 1, 1); grid.attach(widget, 1, row, 1, 1)
+        self.device_dropdown = Gtk.DropDown.new_from_strings(["Aucun appareil"]); grid.attach(Gtk.Label(label="Appareil ADB", xalign=0), 0, 5, 1, 1); grid.attach(self.device_dropdown, 1, 5, 1, 1)
+        buttons = Gtk.Box(spacing=4, homogeneous=True); connection.append(buttons)
+        for label, callback in (("Préparer le Wi-Fi depuis USB", self.prepare_wifi), ("Connecter", self.connect_wifi), ("Déconnecter", self.disconnect_wifi)):
+            short_label = "Préparer Wi-Fi" if label.startswith("Préparer") else label
+            button = Gtk.Button(label=short_label); button.set_tooltip_text(label); button.connect("clicked", callback); buttons.append(button)
+        display = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5); display.set_margin_top(6); display.set_margin_bottom(4); display.set_margin_start(6); display.set_margin_end(6)
+        tabs.append_page(display, Gtk.Label(label="Affichage"))
+        dgrid = Gtk.Grid(column_spacing=6, row_spacing=4); display.append(dgrid)
+        profiles = [*QUALITY_PROFILES, "Personnalisé"]
+        self.profile = Gtk.DropDown.new_from_strings(profiles); self._select_text(self.profile, profiles, self.config.quality_profile); self.profile.connect("notify::selected", self._profile_changed)
+        self.max_size = Gtk.SpinButton.new_with_range(0, 4096, 64); self.max_size.set_value(self.config.max_size)
+        self.max_fps = Gtk.SpinButton.new_with_range(1, 240, 1); self.max_fps.set_value(self.config.max_fps)
+        self.bit_rate = self._entry(self.config.bit_rate); self.codec = self._entry(self.config.codec)
+        self.window_title = self._entry(self.config.window_title)
+        rows = (("Profil vidéo", self.profile), ("Taille maximale", self.max_size), ("FPS maximum", self.max_fps), ("Débit vidéo", self.bit_rate), ("Codec", self.codec), ("Titre de fenêtre", self.window_title))
+        for row, (label, widget) in enumerate(rows): dgrid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1); dgrid.attach(widget, 1, row, 1, 1)
+        checks = Gtk.Grid(column_spacing=8, row_spacing=1); display.append(checks)
+        self.screen_off = Gtk.CheckButton(label="Éteindre l’écran"); self.screen_off.set_active(self.config.turn_screen_off)
+        self.keep_awake = Gtk.CheckButton(label="Empêcher la veille"); self.keep_awake.set_active(self.config.keep_awake)
+        self.top = Gtk.CheckButton(label="Toujours au-dessus"); self.top.set_active(self.config.always_on_top)
+        self.no_audio = Gtk.CheckButton(label="Sans audio"); self.no_audio.set_active(self.config.disable_audio)
+        for index, widget in enumerate((self.screen_off, self.keep_awake, self.top, self.no_audio)):
+            checks.attach(widget, index % 2, index // 2, 1, 1)
+        actions = Gtk.Box(spacing=6); display.append(actions)
+        self.start_button = Gtk.Button(label="Afficher"); self.start_button.connect("clicked", self.start_scrcpy)
+        self.stop_button = Gtk.Button(label="Arrêter"); self.stop_button.set_sensitive(False); self.stop_button.connect("clicked", self.stop_scrcpy)
+        reset_window = Gtk.Button(label="Réinitialiser fenêtre téléphone"); reset_window.set_tooltip_text("Oublier la position et la taille mémorisées de scrcpy"); reset_window.connect("clicked", self._reset_scrcpy_window_geometry)
+        actions.append(self.start_button); actions.append(self.stop_button); actions.append(reset_window)
+
+        console_header = Gtk.Box(spacing=3)
+        console_label = Gtk.Label(label="Terminal", xalign=0); console_label.set_hexpand(True); console_header.append(console_label)
+        clear = Gtk.Button(label="×"); clear.set_tooltip_text("Effacer"); clear.add_css_class("flat"); clear.connect("clicked", lambda _b: self.console.get_buffer().set_text(""))
+        copy = Gtk.Button(label="⧉"); copy.set_tooltip_text("Copier"); copy.add_css_class("flat"); copy.connect("clicked", self._copy_console); console_header.append(clear); console_header.append(copy); root.append(console_header)
+        scroll = Gtk.ScrolledWindow(); scroll.set_min_content_height(82); scroll.set_max_content_height(82); scroll.set_propagate_natural_height(True); scroll.add_css_class("terminal-frame")
+        self.console = Gtk.TextView(editable=False, cursor_visible=False, monospace=True); self.console.add_css_class("terminal"); self.console.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        buffer = self.console.get_buffer()
+        self.log_tags = {
+            "INFO": buffer.create_tag("info", foreground="#67e667"),
+            "WARNING": buffer.create_tag("warning", foreground="#ffd75f"),
+            "ERROR": buffer.create_tag("error", foreground="#ff6b6b", weight=700),
+        }
+        scroll.set_child(self.console); root.append(scroll)
+        active_index = next((i for i, profile in enumerate(self.config.profiles) if profile.id == self.config.active_profile_id), 0)
+        self.phone_profiles.set_selected(active_index)
+        self.phone_profiles.connect("notify::selected", self._phone_profile_changed)
+
+    @staticmethod
+    def _install_css() -> None:
+        provider = Gtk.CssProvider()
+        provider.load_from_data(b"""
+            .terminal-frame { border: 1px solid #303830; border-radius: 3px; }
+            textview.terminal, textview.terminal text {
+                background-color: #080b08;
+                color: #67e667;
+                font-family: Terminus, monospace;
+                font-size: 8pt;
+            }
+            textview.terminal { padding: 3px; }
+        """)
+        display = Gdk.Display.get_default()
+        if display:
+            Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    @staticmethod
+    def _section(title: str) -> Gtk.Box:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7); label = Gtk.Label(label=title, xalign=0); label.add_css_class("heading"); box.append(label); return box
+
+    @staticmethod
+    def _entry(value: str) -> Gtk.Entry:
+        entry = Gtk.Entry(); entry.set_text(value); entry.set_hexpand(True); return entry
+
+    @staticmethod
+    def _select_text(dropdown: Gtk.DropDown, values: list[str], value: str) -> None:
+        dropdown.set_selected(values.index(value) if value in values else 0)
+
+    def log(self, level: str, message: str) -> bool:
+        if not message: return False
+        if not GLib.MainContext.default().is_owner():
+            GLib.idle_add(self.log, level, message)
+            return False
+        buffer = self.console.get_buffer(); end = buffer.get_end_iter()
+        tag = self.log_tags.get(level, self.log_tags["INFO"])
+        buffer.insert_with_tags(end, f"[{datetime.now():%H:%M:%S}] {level:<5} {message}\n", tag)
+        if buffer.get_line_count() > 1000:
+            start = buffer.get_start_iter(); cutoff = buffer.get_iter_at_line(100); buffer.delete(start, cutoff)
+        mark = buffer.create_mark(None, buffer.get_end_iter(), False); self.console.scroll_mark_onscreen(mark); buffer.delete_mark(mark)
+        return False
+
+    def _run_async(self, function: Any, *args: Any) -> None:
+        def runner() -> None:
+            try: function(*args)
+            except Exception as exc: GLib.idle_add(self._error, str(exc))
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _initialize(self) -> None:
+        self.log("INFO", f"adb trouvé : {self.adb.binary or 'absent'}")
+        self.caps = self.scrcpy.detect()
+        GLib.idle_add(self._capabilities_ready)
+        if self.guard.path.exists():
+            self.log("WARNING", "Récupération d’un délai de veille temporaire…")
+            self.guard.restore()
+        self._refresh_worker()
+
+    def _capabilities_ready(self) -> bool:
+        self.log("INFO", f"scrcpy trouvé : {self.scrcpy.binary}, version {self.caps.version}")
+        codec_ok = self.caps.supports("--video-codec"); self.codec.set_sensitive(codec_ok); self.codec.set_tooltip_text(None if codec_ok else "Codec configurable non pris en charge par cette version")
+        audio_ok = self.caps.supports("--no-audio"); self.no_audio.set_sensitive(audio_ok); self.no_audio.set_tooltip_text(None if audio_ok else "Gestion audio indisponible dans cette version")
+        return False
+
+    def refresh(self) -> None: self.status.set_text("● Recherche…"); self._run_async(self._refresh_worker)
+
+    def _refresh_worker(self) -> None:
+        devices = self.adb.devices(); GLib.idle_add(self._show_devices, devices)
+
+    def _show_devices(self, devices: list[AdbDevice]) -> bool:
+        self.devices = devices
+        labels = [f"{d.model or d.serial} — {d.status} ({d.kind.value})" for d in devices] or ["Aucun appareil"]
+        self.device_dropdown.set_model(Gtk.StringList.new(labels)); self.device_dropdown.set_selected(0)
+        authorized = [d for d in devices if d.status == "device"]
+        unauthorized = [d for d in devices if d.status == "unauthorized"]
+        tcp = [d for d in authorized if d.kind == DeviceKind.TCPIP]
+        usb = [d for d in authorized if d.kind == DeviceKind.USB]
+        if tcp: text = "● Connecté en Wi-Fi"
+        elif usb: text = "● Connecté en USB"
+        elif unauthorized: text = "● USB non autorisé"
+        else: text = "● Non détecté"
+        self.status.set_text(text); self.start_button.set_sensitive(bool(authorized))
+        current_name = self.name.get_text().strip()
+        if len(authorized) == 1 and (current_name in ("", "Mon téléphone") or current_name.startswith("Téléphone ")):
+            device = authorized[0]
+            if device.model:
+                self.name.set_text(device.model)
+                self.title_label.set_text(device.model)
+                self.window_title.set_text(f"{device.model} — Telechipo")
+                if device.kind == DeviceKind.TCPIP and ":" in device.serial and not self.ip.get_text().strip():
+                    self.ip.set_text(device.serial.rsplit(":", 1)[0])
+                self._save()
+                self._refresh_profile_dropdown()
+        return False
+
+    def _refresh_profile_dropdown(self) -> None:
+        self._switching_profile = True
+        self.phone_profiles.set_model(Gtk.StringList.new([profile.phone_name for profile in self.config.profiles]))
+        index = next((i for i, profile in enumerate(self.config.profiles) if profile.id == self.config.active_profile_id), 0)
+        self.phone_profiles.set_selected(index)
+        self._switching_profile = False
+
+    def _phone_profile_changed(self, dropdown: Gtk.DropDown, _param: Any) -> None:
+        if self._switching_profile:
+            return
+        index = dropdown.get_selected()
+        if index >= len(self.config.profiles):
+            return
+        self._read_config()
+        self.config.active_profile_id = self.config.profiles[index].id
+        self._load_active_profile()
+        self.store.save(self.config)
+
+    def _new_phone_profile(self, _button: Gtk.Button) -> None:
+        self._read_config()
+        profile = PhoneProfile(phone_name=f"Téléphone {len(self.config.profiles) + 1}")
+        self.config.profiles.append(profile); self.config.active_profile_id = profile.id
+        self._load_active_profile(); self._refresh_profile_dropdown(); self.store.save(self.config)
+
+    def _delete_phone_profile(self, _button: Gtk.Button) -> None:
+        if len(self.config.profiles) == 1:
+            self._error("Il faut conserver au moins un profil téléphone.")
+            return
+        current = self.config.active_profile
+        self.config.profiles.remove(current); self.config.active_profile_id = self.config.profiles[0].id
+        self._load_active_profile(); self._refresh_profile_dropdown(); self.store.save(self.config)
+
+    def _load_active_profile(self) -> None:
+        profile = self.config.active_profile
+        self.name.set_text(profile.phone_name); self.ip.set_text(profile.ip_address); self.port.set_value(profile.port)
+        self._select_text(self.mode, ["Automatique", "Wi-Fi", "USB"], profile.preferred_mode)
+        profiles = [*QUALITY_PROFILES, "Personnalisé"]; self._select_text(self.profile, profiles, profile.quality_profile)
+        self.max_size.set_value(profile.max_size); self.max_fps.set_value(profile.max_fps); self.bit_rate.set_text(profile.bit_rate); self.codec.set_text(profile.codec)
+        self.screen_off.set_active(profile.turn_screen_off); self.keep_awake.set_active(profile.keep_awake); self.top.set_active(profile.always_on_top); self.no_audio.set_active(profile.disable_audio)
+        self.window_title.set_text(profile.window_title); self.title_label.set_text(profile.phone_name)
+
+    def _chosen(self, kind: DeviceKind | None = None) -> AdbDevice:
+        candidates = [d for d in self.devices if d.status == "device" and (kind is None or d.kind == kind)]
+        if not candidates: raise AdbError("Aucun appareil autorisé correspondant.")
+        selected = self.device_dropdown.get_selected()
+        if selected < len(self.devices) and self.devices[selected] in candidates: return self.devices[selected]
+        if len(candidates) == 1: return candidates[0]
+        raise AdbError("Plusieurs appareils sont présents : choisissez explicitement l’appareil dans la liste.")
+
+    def prepare_wifi(self, _button: Gtk.Button) -> None:
+        try: device = self._chosen(DeviceKind.USB)
+        except Exception as exc: self._error(str(exc)); return
+        self._run_async(self._prepare_worker, device, int(self.port.get_value()), self.ip.get_text())
+    def _prepare_worker(self, device: AdbDevice, port: int, fallback_ip: str) -> None:
+        self.log("INFO", f"Appareil USB détecté : {device.model or device.serial}")
+        detected_ip = self.adb.wifi_ip(device.serial)
+        self.log("INFO", f"Activation ADB TCP/IP sur le port {port}"); self.adb.enable_tcpip(device.serial, port); time.sleep(2)
+        endpoint = self.adb.connect(detected_ip or fallback_ip, port)
+        if detected_ip: GLib.idle_add(self.ip.set_text, detected_ip)
+        self.log("INFO", f"Connexion à {endpoint} réussie"); self._refresh_worker(); GLib.idle_add(self._save)
+
+    def connect_wifi(self, _button: Gtk.Button) -> None: self._connect_action(False)
+    def connect_and_show(self, _button: Gtk.Button) -> None: self._connect_action(True)
+    def _connect_action(self, launch: bool) -> None:
+        config = self._read_config(); self._run_async(self._connect_worker, launch, config.ip_address, config.port, config)
+    def _connect_worker(self, launch: bool, ip: str, port: int, config: AppConfig) -> None:
+        GLib.idle_add(self.status.set_text, "● Connexion Wi-Fi en cours")
+        endpoint = self.adb.connect(ip, port); self.log("INFO", f"Connexion à {endpoint} réussie")
+        devices = self.adb.devices(); GLib.idle_add(self._show_devices, devices)
+        if launch:
+            tcp = [d for d in devices if d.serial == endpoint and d.status == "device"]
+            if not tcp: raise AdbError("La connexion existe mais l’appareil n’est pas encore prêt.")
+            self._start_worker(tcp[0].serial, config)
+
+    def disconnect_wifi(self, _button: Gtk.Button) -> None:
+        self._run_async(self._disconnect_worker, self.ip.get_text(), int(self.port.get_value()))
+    def _disconnect_worker(self, ip: str, port: int) -> None:
+        if self.scrcpy.process and self.scrcpy.process.poll() is None: raise AdbError("Arrêtez scrcpy avant de déconnecter le téléphone.")
+        self.adb.disconnect(ip, port); self.log("INFO", "Connexion ADB Wi-Fi déconnectée."); self._refresh_worker()
+
+    def start_scrcpy(self, _button: Gtk.Button) -> None:
+        try: serial = self._chosen().serial
+        except Exception as exc: self._error(str(exc)); return
+        self._run_async(self._start_worker, serial, self._read_config())
+    def _start_worker(self, device_serial: str, config: AppConfig) -> None:
+        self._ignore_scrcpy_geometry = False
+        if config.keep_awake and not self.caps.supports("--stay-awake") and not self.caps.supports("--screen-off-timeout"):
+            self.guard.apply(device_serial); self.log("INFO", "Délai de veille Android temporairement prolongé.")
+        command = self.scrcpy.start(device_serial, config, self.caps); self.log("INFO", "Commande : " + " ".join(command)); GLib.idle_add(self._scrcpy_started)
+
+    def _scrcpy_started(self) -> bool:
+        self.status.set_text("● scrcpy actif"); self.start_button.set_sensitive(False); self.stop_button.set_sensitive(True); self.phone_profiles.set_sensitive(False)
+        GLib.timeout_add(750, self._schedule_scrcpy_geometry_capture)
+        return False
+
+    def stop_scrcpy(self, _button: Gtk.Button) -> None:
+        self._run_async(self._stop_scrcpy_worker)
+    def _stop_scrcpy_worker(self) -> None:
+        self._capture_scrcpy_geometry_worker()
+        self.scrcpy.stop()
+    def _scrcpy_exited(self, code: int) -> bool:
+        self.guard.restore(); self.log("INFO" if code == 0 else "WARNING", f"scrcpy fermé (code {code}), délai de veille restauré")
+        self.store.save(self._read_config())
+        self.stop_button.set_sensitive(False); self.start_button.set_sensitive(True); self.phone_profiles.set_sensitive(True); self.refresh(); return False
+
+    def _schedule_scrcpy_geometry_capture(self) -> bool:
+        process = self.scrcpy.process
+        if not process or process.poll() is not None:
+            return False
+        if not self._scrcpy_geometry_capture_running:
+            self._scrcpy_geometry_capture_running = True
+            self._run_async(self._capture_scrcpy_geometry_worker)
+        return True
+
+    def _capture_scrcpy_geometry_worker(self) -> None:
+        try:
+            process = self.scrcpy.process
+            geometry = self.geometry.read_for_pid(process.pid) if process and process.poll() is None and not self._ignore_scrcpy_geometry else None
+            if geometry:
+                GLib.idle_add(self._store_scrcpy_geometry, geometry.x, geometry.y, geometry.width, geometry.height)
+        finally:
+            self._scrcpy_geometry_capture_running = False
+
+    def _store_scrcpy_geometry(self, x: int, y: int, width: int, height: int) -> bool:
+        profile = self.config.active_profile
+        profile.scrcpy_window_x, profile.scrcpy_window_y = x, y
+        profile.scrcpy_window_width, profile.scrcpy_window_height = width, height
+        self.store.save(self._read_config())
+        return False
+
+    def _reset_scrcpy_window_geometry(self, _button: Gtk.Button) -> None:
+        profile = self.config.active_profile
+        profile.scrcpy_window_x = profile.scrcpy_window_y = None
+        profile.scrcpy_window_width = profile.scrcpy_window_height = None
+        self._ignore_scrcpy_geometry = True
+        self.store.save(self._read_config())
+        self.log("INFO", "Position et taille de la fenêtre du téléphone oubliées ; le réglage automatique sera utilisé au prochain affichage.")
+
+    def _profile_changed(self, dropdown: Gtk.DropDown, _param: Any) -> None:
+        name = dropdown.get_selected_item().get_string(); profile = QUALITY_PROFILES.get(name)
+        if profile: self.max_size.set_value(profile["max_size"]); self.max_fps.set_value(profile["max_fps"]); self.bit_rate.set_text(profile["bit_rate"]); self.codec.set_text(profile["codec"]); self.no_audio.set_active(profile["disable_audio"])
+
+    def _read_config(self) -> AppConfig:
+        selected = self.profile.get_selected_item(); mode = self.mode.get_selected_item()
+        self.config.phone_name = self.name.get_text().strip() or "Téléphone"; self.config.ip_address = self.ip.get_text().strip(); self.config.port = int(self.port.get_value())
+        self.config.preferred_mode = mode.get_string(); self.config.quality_profile = selected.get_string(); self.config.max_size = int(self.max_size.get_value()); self.config.max_fps = int(self.max_fps.get_value())
+        self.config.bit_rate = self.bit_rate.get_text().strip(); self.config.codec = self.codec.get_text().strip(); self.config.turn_screen_off = self.screen_off.get_active(); self.config.keep_awake = self.keep_awake.get_active()
+        self.config.always_on_top = self.top.get_active(); self.config.disable_audio = self.no_audio.get_active(); self.config.window_title = self.window_title.get_text(); self.config.tool_versions = {"scrcpy": self.caps.version}
+        self.title_label.set_text(self.config.phone_name)
+        return self.config
+
+    def _save(self) -> bool: self.store.save(self._read_config()); return False
+    def _error(self, message: str) -> bool: self.status.set_text("● Erreur"); self.log("ERROR", message); return False
+    def _copy_console(self, _button: Gtk.Button) -> None:
+        buffer = self.console.get_buffer(); text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False); Gdk.Display.get_default().get_clipboard().set(text)
+    def _on_close(self, _window: Gtk.Window) -> bool:
+        self.get_application().quit(); return True
+    def shutdown(self) -> None:
+        if self._closing: return
+        self._closing = True
+        process = self.scrcpy.process
+        if process and process.poll() is None and not self._ignore_scrcpy_geometry:
+            geometry = self.geometry.read_for_pid(process.pid)
+            if geometry:
+                profile = self.config.active_profile
+                profile.scrcpy_window_x, profile.scrcpy_window_y = geometry.x, geometry.y
+                profile.scrcpy_window_width, profile.scrcpy_window_height = geometry.width, geometry.height
+        self._save(); self.scrcpy.stop(); self.guard.restore()

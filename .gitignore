@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+venv/
+build/
+dist/
+
+# Local design brief contains machine/device-specific context.
+brief_agent/
+

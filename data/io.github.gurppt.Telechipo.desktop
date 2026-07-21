@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Telechipo
+Comment=Piloter un téléphone Android avec adb et scrcpy
+Exec=telechipo
+Icon=io.github.gurppt.Telechipo
+Terminal=false
+Categories=Utility;System;
+StartupNotify=true
+
