@@ -1,6 +1,6 @@
 # Telechipo
 
-Telechipo est une petite interface GTK4 pour connecter un téléphone Android avec ADB Wi-Fi permttant l'affichage sur le bureau et l'intéraction, utilisant scrcpy. Elle gère plusieurs téléphones, mémorise leurs réglages et permet d'empêcher la veille ou éteindre l'écran. Le copier-coller de texte est supporté de l'ordinateur au téléphone.
+Telechipo est une petite interface GTK4 pour connecter un téléphone Android avec ADB Wi-Fi permettant l'affichage sur le bureau et l'intéraction, utilisant scrcpy. Elle gère plusieurs téléphones, mémorise leurs réglages et permet d'empêcher la veille ou éteindre l'écran. Le copier-coller de texte est supporté de l'ordinateur au téléphone.
 
 Application conçu à la base parce que j'en avais marre de répondre aux SMS en tapant sur un clavier minuscule avec mes gros doigts saucisses.
 
