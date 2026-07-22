@@ -46,6 +46,7 @@ class PhoneProfile:
     id: str = field(default_factory=lambda: uuid4().hex)
     phone_name: str = "Mon téléphone"
     ip_address: str = ""
+    device_identity: str = ""
     port: int = 5555
     preferred_mode: str = "Automatique"
     quality_profile: str = "Équilibré"
@@ -88,7 +89,7 @@ class AppConfig:
 
 # Keep the process/configuration APIs pleasantly small while settings live per phone.
 for _name in (
-    "phone_name", "ip_address", "port", "preferred_mode", "quality_profile",
+    "phone_name", "ip_address", "device_identity", "port", "preferred_mode", "quality_profile",
     "max_size", "max_fps", "bit_rate", "codec", "turn_screen_off", "keep_awake",
     "always_on_top", "disable_audio", "window_title",
     "scrcpy_window_x", "scrcpy_window_y", "scrcpy_window_width", "scrcpy_window_height",

@@ -3,9 +3,11 @@ from __future__ import annotations
 import ipaddress
 import re
 import shutil
+import socket
 import subprocess
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from ..models import AdbDevice, DeviceKind
 
@@ -38,6 +40,45 @@ def validate_endpoint(ip: str, port: int) -> str:
     if not 1 <= int(port) <= 65535:
         raise AdbError("Le port doit être compris entre 1 et 65535.")
     return f"{address}:{int(port)}"
+
+
+def scan_tcp_subnet(
+    ip: str,
+    port: int,
+    timeout: float = 0.6,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[str, list[str]]:
+    """Return hosts accepting TCP connections in the saved IPv4 /24 subnet."""
+    try:
+        address = ipaddress.ip_address(ip.strip())
+    except ValueError as exc:
+        raise AdbError("L’ancienne adresse IP du téléphone est nécessaire pour déterminer le réseau local.") from exc
+    if address.version != 4 or address.is_loopback or address.is_link_local:
+        raise AdbError("La découverte automatique nécessite une ancienne adresse IPv4 locale valide.")
+    network = ipaddress.ip_network(f"{address}/24", strict=False)
+    if progress:
+        progress(str(network))
+
+    def is_open(host: str) -> bool:
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    # Probe the saved address first with extra time. The initial ARP exchange or
+    # a Wi-Fi power-saving state may make the first connection unusually slow.
+    saved_host = str(address)
+    try:
+        with socket.create_connection((saved_host, int(port)), timeout=max(1.5, timeout)):
+            found = [saved_host]
+    except OSError:
+        found = []
+
+    hosts = [str(host) for host in network.hosts() if str(host) != saved_host]
+    with ThreadPoolExecutor(max_workers=64) as executor:
+        found.extend(host for host, opened in zip(hosts, executor.map(is_open, hosts)) if opened)
+    return str(network), found
 
 
 class AdbClient:
@@ -98,6 +139,15 @@ class AdbClient:
         output = self.run(["shell", "ip", "-f", "inet", "addr", "show", "wlan0"], serial=serial)
         match = re.search(r"\binet\s+(\d+(?:\.\d+){3})/", output)
         return match.group(1) if match else None
+
+    def device_identity(self, serial: str) -> str:
+        identity = self.run(["shell", "getprop", "ro.serialno"], serial=serial).strip()
+        if not identity:
+            identity = self.run(["shell", "getprop", "ro.boot.serialno"], serial=serial).strip()
+        return identity
+
+    def device_model(self, serial: str) -> str:
+        return self.run(["shell", "getprop", "ro.product.model"], serial=serial).strip()
 
     def get_setting(self, serial: str, key: str) -> str:
         return self.run(["shell", "settings", "get", "system", key], serial=serial).strip()

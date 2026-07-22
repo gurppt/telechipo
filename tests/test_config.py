@@ -10,10 +10,11 @@ class ConfigTests(unittest.TestCase):
     def test_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config.json")
-            config = AppConfig(profiles=[PhoneProfile(phone_name="Pixel", ip_address="10.0.0.8", port=5566)])
+            config = AppConfig(profiles=[PhoneProfile(phone_name="Pixel", ip_address="10.0.0.8", device_identity="ABC123", port=5566)])
             store.save(config)
             self.assertEqual(store.load().ip_address, "10.0.0.8")
             self.assertEqual(store.load().port, 5566)
+            self.assertEqual(store.load().device_identity, "ABC123")
 
     def test_multiple_phone_profiles(self):
         with tempfile.TemporaryDirectory() as directory:

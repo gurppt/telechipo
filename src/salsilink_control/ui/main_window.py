@@ -8,7 +8,7 @@ from typing import Any
 from gi.repository import Gdk, GLib, Gtk
 
 from ..config import ConfigStore
-from ..core.adb_client import AdbClient, AdbError
+from ..core.adb_client import AdbClient, AdbError, scan_tcp_subnet
 from ..core.scrcpy_client import ScrcpyClient
 from ..core.session_manager import SleepTimeoutGuard
 from ..core.window_geometry import X11GeometryController
@@ -59,9 +59,11 @@ class MainWindow(Gtk.ApplicationWindow):
         remove_profile = Gtk.Button(label="−"); remove_profile.set_tooltip_text("Supprimer ce profil"); remove_profile.connect("clicked", self._delete_phone_profile)
         profile_row.append(add_profile); profile_row.append(remove_profile)
         self.name = self._entry(self.config.phone_name); self.ip = self._entry(self.config.ip_address)
+        ip_row = Gtk.Box(spacing=4); ip_row.append(self.ip)
+        discover = Gtk.Button(label="Détecter"); discover.set_tooltip_text("Retrouver ce téléphone sur le réseau local"); discover.connect("clicked", self.discover_wifi); ip_row.append(discover)
         self.port = Gtk.SpinButton.new_with_range(1, 65535, 1); self.port.set_value(self.config.port)
         self.mode = Gtk.DropDown.new_from_strings(["Automatique", "Wi-Fi", "USB"]); self._select_text(self.mode, ["Automatique", "Wi-Fi", "USB"], self.config.preferred_mode)
-        for row, (label, widget) in enumerate((("Téléphone", profile_row), ("Nom", self.name), ("Adresse IP", self.ip), ("Port", self.port), ("Mode préféré", self.mode))):
+        for row, (label, widget) in enumerate((("Téléphone", profile_row), ("Nom", self.name), ("Adresse IP", ip_row), ("Port", self.port), ("Mode préféré", self.mode))):
             lab = Gtk.Label(label=label, xalign=0); grid.attach(lab, 0, row, 1, 1); grid.attach(widget, 1, row, 1, 1)
         self.device_dropdown = Gtk.DropDown.new_from_strings(["Aucun appareil"]); grid.attach(Gtk.Label(label="Appareil ADB", xalign=0), 0, 5, 1, 1); grid.attach(self.device_dropdown, 1, 5, 1, 1)
         buttons = Gtk.Box(spacing=4, homogeneous=True); connection.append(buttons)
@@ -305,8 +307,66 @@ class MainWindow(Gtk.ApplicationWindow):
         if not target_ip.strip():
             raise AdbError("Adresse Wi-Fi introuvable. Vérifiez que le téléphone est connecté au Wi-Fi.")
         endpoint = self.adb.connect_with_retry(target_ip, port)
+        identity = self.adb.device_identity(endpoint)
         if detected_ip: GLib.idle_add(self.ip.set_text, detected_ip)
+        GLib.idle_add(self._remember_device_identity, self.config.active_profile_id, identity)
         self.log("INFO", f"Connexion à {endpoint} réussie"); self._refresh_worker(); GLib.idle_add(self._save)
+
+    def discover_wifi(self, _button: Gtk.Button) -> None:
+        config = self._read_config()
+        profile = config.active_profile
+        self._set_status("Détection réseau…", "pending")
+        self._run_async(self._discover_worker, profile.id, profile.ip_address, profile.port, profile.device_identity)
+
+    def _discover_worker(self, profile_id: str, previous_ip: str, port: int, expected_identity: str) -> None:
+        self.log("INFO", "Détection Wi-Fi — étape 1/4 : détermination du réseau depuis la dernière adresse connue.")
+        network, hosts = scan_tcp_subnet(
+            previous_ip,
+            port,
+            progress=lambda subnet: self.log("INFO", f"Détection Wi-Fi — étape 2/4 : test prioritaire de {previous_ip}, puis recherche du port ADB {port} sur {subnet}."),
+        )
+        self.log("INFO", f"Détection Wi-Fi — {len(hosts)} adresse(s) candidate(s) trouvée(s).")
+        matches: list[tuple[str, str, str]] = []
+        self.log("INFO", "Détection Wi-Fi — étape 3/4 : vérification des appareils avec ADB.")
+        for host in hosts:
+            try:
+                endpoint = self.adb.connect(host, port)
+                identity = self.adb.device_identity(endpoint)
+                model = self.adb.device_model(endpoint)
+                self.log("INFO", f"Candidat ADB : {host} — {model or 'modèle inconnu'}")
+                if identity and (not expected_identity or identity == expected_identity):
+                    matches.append((host, identity, model))
+            except AdbError as exc:
+                self.log("WARNING", f"Candidat {host} ignoré : {exc}")
+        if not matches:
+            if expected_identity:
+                raise AdbError("Le téléphone enregistré n’a pas été retrouvé sur ce réseau.")
+            raise AdbError("Aucun téléphone ADB identifiable n’a été trouvé sur ce réseau.")
+        if len(matches) > 1:
+            raise AdbError("Plusieurs téléphones ADB ont été trouvés ; connectez d’abord celui voulu manuellement.")
+        host, identity, model = matches[0]
+        self.log("INFO", f"Détection Wi-Fi — étape 4/4 : téléphone reconnu à l’adresse {host}.")
+        GLib.idle_add(self._apply_discovered_device, profile_id, host, identity, model)
+
+    def _remember_device_identity(self, profile_id: str, identity: str) -> bool:
+        if identity:
+            profile = next((item for item in self.config.profiles if item.id == profile_id), None)
+            if profile:
+                profile.device_identity = identity
+                self.store.save(self.config)
+        return False
+
+    def _apply_discovered_device(self, profile_id: str, host: str, identity: str, model: str) -> bool:
+        profile = next((item for item in self.config.profiles if item.id == profile_id), None)
+        if not profile:
+            return False
+        profile.ip_address = host; profile.device_identity = identity
+        if profile.id == self.config.active_profile_id:
+            self.ip.set_text(host)
+        self.store.save(self._read_config())
+        self.log("INFO", f"Adresse du profil mise à jour : {host} ({model or 'téléphone Android'}).")
+        self._refresh_worker()
+        return False
 
     def connect_wifi(self, _button: Gtk.Button) -> None: self._connect_action(False)
     def connect_and_show(self, _button: Gtk.Button) -> None: self._connect_action(True)
@@ -315,6 +375,8 @@ class MainWindow(Gtk.ApplicationWindow):
     def _connect_worker(self, launch: bool, ip: str, port: int, config: AppConfig) -> None:
         GLib.idle_add(self._set_status, "Connexion Wi-Fi en cours", "pending")
         endpoint = self.adb.connect(ip, port); self.log("INFO", f"Connexion à {endpoint} réussie")
+        identity = self.adb.device_identity(endpoint)
+        GLib.idle_add(self._remember_device_identity, config.active_profile_id, identity)
         devices = self.adb.devices(); GLib.idle_add(self._show_devices, devices)
         if launch:
             tcp = [d for d in devices if d.serial == endpoint and d.status == "device"]
