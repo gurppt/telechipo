@@ -14,6 +14,7 @@ from .ui.main_window import MainWindow
 class TelechipoApplication(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id="io.github.gurppt.Telechipo", flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        Gtk.Window.set_default_icon_name("io.github.gurppt.Telechipo")
         self.window: MainWindow | None = None
 
     def do_activate(self) -> None:

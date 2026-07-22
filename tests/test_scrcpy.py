@@ -28,6 +28,12 @@ class ScrcpyTests(unittest.TestCase):
         command = build_command("scrcpy", "abc", AppConfig(), caps)
         self.assertEqual(command[-2:], ["--screen-off-timeout", "86400"])
 
+    def test_screen_timeout_is_preferred_over_plugged_in_only_stay_awake(self):
+        caps = parse_scrcpy_capabilities("scrcpy 3.0", "--stay-awake --screen-off-timeout=seconds")
+        command = build_command("scrcpy", "abc", AppConfig(), caps)
+        self.assertIn("--screen-off-timeout", command)
+        self.assertNotIn("--stay-awake", command)
+
     def test_phone_window_geometry(self):
         config = AppConfig()
         config.scrcpy_window_x, config.scrcpy_window_y = 40, 50

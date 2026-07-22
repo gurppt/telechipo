@@ -43,10 +43,12 @@ def build_command(binary: str, serial: str, config: AppConfig, caps: ScrcpyCapab
         command.append("--always-on-top")
     if config.disable_audio and caps.supports("--no-audio"):
         command.append("--no-audio")
-    if config.keep_awake and caps.supports("--stay-awake"):
-        command.append("--stay-awake")
-    elif config.keep_awake and caps.supports("--screen-off-timeout"):
+    # --stay-awake only works while Android considers itself plugged in.  The
+    # explicit timeout also covers wireless sessions on recent scrcpy versions.
+    if config.keep_awake and caps.supports("--screen-off-timeout"):
         command += ["--screen-off-timeout", "86400"]
+    elif config.keep_awake and caps.supports("--stay-awake"):
+        command.append("--stay-awake")
     return command
 
 

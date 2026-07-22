@@ -4,6 +4,7 @@ import ipaddress
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Callable
 
 from ..models import AdbDevice, DeviceKind
@@ -71,6 +72,19 @@ class AdbClient:
         if "connected to" not in output.lower() and "already connected" not in output.lower():
             raise AdbError(output or "Connexion ADB Wi-Fi impossible.")
         return endpoint
+
+    def connect_with_retry(self, ip: str, port: int, attempts: int = 5, delay: float = 1.0) -> str:
+        """Connect after ``adb tcpip``, while adbd may still be restarting."""
+        last_error: AdbError | None = None
+        for attempt in range(max(1, attempts)):
+            try:
+                return self.connect(ip, port)
+            except AdbError as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(delay)
+        assert last_error is not None
+        raise last_error
 
     def disconnect(self, ip: str, port: int) -> None:
         self.run(["disconnect", validate_endpoint(ip, port)])

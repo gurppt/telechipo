@@ -44,7 +44,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         header = Gtk.Box(spacing=6)
         self.title_label = Gtk.Label(label=self.config.phone_name); self.title_label.add_css_class("heading"); self.title_label.set_hexpand(True); self.title_label.set_xalign(0)
-        self.status = Gtk.Label(label="● Non détecté"); self.status.add_css_class("dim-label")
+        self.status = Gtk.Label(label="● Non détecté"); self.status.add_css_class("status-error")
         refresh = Gtk.Button(label="Actualiser"); refresh.connect("clicked", lambda _b: self.refresh())
         header.append(self.title_label); header.append(self.status); header.append(refresh); root.append(header)
 
@@ -68,6 +68,10 @@ class MainWindow(Gtk.ApplicationWindow):
         for label, callback in (("Préparer le Wi-Fi depuis USB", self.prepare_wifi), ("Connecter", self.connect_wifi), ("Déconnecter", self.disconnect_wifi)):
             short_label = "Préparer Wi-Fi" if label.startswith("Préparer") else label
             button = Gtk.Button(label=short_label); button.set_tooltip_text(label); button.connect("clicked", callback); buttons.append(button)
+            if callback == self.prepare_wifi:
+                self.prepare_wifi_button = button
+                button.set_sensitive(False)
+                button.set_tooltip_text("Branchez un téléphone autorisé en USB pour activer ADB Wi-Fi")
         display = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5); display.set_margin_top(6); display.set_margin_bottom(4); display.set_margin_start(6); display.set_margin_end(6)
         tabs.append_page(display, Gtk.Label(label="Affichage"))
         dgrid = Gtk.Grid(column_spacing=6, row_spacing=4); display.append(dgrid)
@@ -76,9 +80,28 @@ class MainWindow(Gtk.ApplicationWindow):
         self.max_size = Gtk.SpinButton.new_with_range(0, 4096, 64); self.max_size.set_value(self.config.max_size)
         self.max_fps = Gtk.SpinButton.new_with_range(1, 240, 1); self.max_fps.set_value(self.config.max_fps)
         self.bit_rate = self._entry(self.config.bit_rate); self.codec = self._entry(self.config.codec)
+        self.max_size.set_width_chars(6); self.max_size.set_hexpand(True)
+        self.max_fps.set_width_chars(5); self.max_fps.set_hexpand(True)
+        self.bit_rate.set_width_chars(4); self.bit_rate.set_max_width_chars(5); self.bit_rate.set_hexpand(False)
+        self.codec.set_width_chars(6); self.codec.set_hexpand(False)
         self.window_title = self._entry(self.config.window_title)
-        rows = (("Profil vidéo", self.profile), ("Taille maximale", self.max_size), ("FPS maximum", self.max_fps), ("Débit vidéo", self.bit_rate), ("Codec", self.codec), ("Titre de fenêtre", self.window_title))
-        for row, (label, widget) in enumerate(rows): dgrid.attach(Gtk.Label(label=label, xalign=0), 0, row, 1, 1); dgrid.attach(widget, 1, row, 1, 1)
+        dgrid.attach(Gtk.Label(label="Profil vidéo", xalign=0), 0, 0, 1, 1)
+        dgrid.attach(self.profile, 1, 0, 1, 1)
+
+        video_row = Gtk.Grid(column_spacing=5)
+        for column, (label, widget) in enumerate((("Taille max.", self.max_size), ("FPS max.", self.max_fps), ("Débit", self.bit_rate))):
+            video_row.attach(Gtk.Label(label=label, xalign=0), column * 2, 0, 1, 1)
+            video_row.attach(widget, column * 2 + 1, 0, 1, 1)
+        dgrid.attach(video_row, 0, 1, 2, 1)
+
+        identity_row = Gtk.Grid(column_spacing=5)
+        identity_row.attach(Gtk.Label(label="Codec", xalign=0), 0, 0, 1, 1)
+        identity_row.attach(self.codec, 1, 0, 1, 1)
+        identity_row.attach(Gtk.Label(label="Titre de fenêtre", xalign=0), 2, 0, 1, 1)
+        identity_row.attach(self.window_title, 3, 0, 1, 1)
+        self.window_title.set_hexpand(True)
+        identity_row.set_hexpand(True)
+        dgrid.attach(identity_row, 0, 2, 2, 1)
         checks = Gtk.Grid(column_spacing=8, row_spacing=1); display.append(checks)
         self.screen_off = Gtk.CheckButton(label="Éteindre l’écran"); self.screen_off.set_active(self.config.turn_screen_off)
         self.keep_awake = Gtk.CheckButton(label="Empêcher la veille"); self.keep_awake.set_active(self.config.keep_awake)
@@ -96,7 +119,7 @@ class MainWindow(Gtk.ApplicationWindow):
         console_label = Gtk.Label(label="Terminal", xalign=0); console_label.set_hexpand(True); console_header.append(console_label)
         clear = Gtk.Button(label="×"); clear.set_tooltip_text("Effacer"); clear.add_css_class("flat"); clear.connect("clicked", lambda _b: self.console.get_buffer().set_text(""))
         copy = Gtk.Button(label="⧉"); copy.set_tooltip_text("Copier"); copy.add_css_class("flat"); copy.connect("clicked", self._copy_console); console_header.append(clear); console_header.append(copy); root.append(console_header)
-        scroll = Gtk.ScrolledWindow(); scroll.set_min_content_height(82); scroll.set_max_content_height(82); scroll.set_propagate_natural_height(True); scroll.add_css_class("terminal-frame")
+        scroll = Gtk.ScrolledWindow(); scroll.set_min_content_height(150); scroll.set_max_content_height(150); scroll.set_propagate_natural_height(True); scroll.add_css_class("terminal-frame")
         self.console = Gtk.TextView(editable=False, cursor_visible=False, monospace=True); self.console.add_css_class("terminal"); self.console.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         buffer = self.console.get_buffer()
         self.log_tags = {
@@ -121,6 +144,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 font-size: 8pt;
             }
             textview.terminal { padding: 3px; }
+            label.status-ok { color: #2ec27e; font-weight: 700; }
+            label.status-pending { color: #f5c211; font-weight: 700; }
+            label.status-error { color: #e01b24; font-weight: 700; }
         """)
         display = Gdk.Display.get_default()
         if display:
@@ -172,7 +198,14 @@ class MainWindow(Gtk.ApplicationWindow):
         audio_ok = self.caps.supports("--no-audio"); self.no_audio.set_sensitive(audio_ok); self.no_audio.set_tooltip_text(None if audio_ok else "Gestion audio indisponible dans cette version")
         return False
 
-    def refresh(self) -> None: self.status.set_text("● Recherche…"); self._run_async(self._refresh_worker)
+    def _set_status(self, text: str, state: str) -> bool:
+        for css_class in ("status-ok", "status-pending", "status-error"):
+            self.status.remove_css_class(css_class)
+        self.status.add_css_class(f"status-{state}")
+        self.status.set_text(f"● {text}")
+        return False
+
+    def refresh(self) -> None: self._set_status("Recherche…", "pending"); self._run_async(self._refresh_worker)
 
     def _refresh_worker(self) -> None:
         devices = self.adb.devices(); GLib.idle_add(self._show_devices, devices)
@@ -185,11 +218,18 @@ class MainWindow(Gtk.ApplicationWindow):
         unauthorized = [d for d in devices if d.status == "unauthorized"]
         tcp = [d for d in authorized if d.kind == DeviceKind.TCPIP]
         usb = [d for d in authorized if d.kind == DeviceKind.USB]
-        if tcp: text = "● Connecté en Wi-Fi"
-        elif usb: text = "● Connecté en USB"
-        elif unauthorized: text = "● USB non autorisé"
-        else: text = "● Non détecté"
-        self.status.set_text(text); self.start_button.set_sensitive(bool(authorized))
+        self.prepare_wifi_button.set_sensitive(bool(usb))
+        if usb:
+            self.prepare_wifi_button.set_tooltip_text("Activer ADB Wi-Fi depuis le téléphone USB sélectionné")
+        elif unauthorized:
+            self.prepare_wifi_button.set_tooltip_text("Déverrouillez le téléphone et acceptez l’autorisation de débogage USB")
+        else:
+            self.prepare_wifi_button.set_tooltip_text("Branchez un téléphone autorisé en USB pour activer ADB Wi-Fi")
+        if tcp: text, state = "Connecté en Wi-Fi", "ok"
+        elif usb: text, state = "Connecté en USB", "ok"
+        elif unauthorized: text, state = "USB non autorisé", "error"
+        else: text, state = "Non détecté", "error"
+        self._set_status(text, state); self.start_button.set_sensitive(bool(authorized))
         current_name = self.name.get_text().strip()
         if len(authorized) == 1 and (current_name in ("", "Mon téléphone") or current_name.startswith("Téléphone ")):
             device = authorized[0]
@@ -254,13 +294,17 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def prepare_wifi(self, _button: Gtk.Button) -> None:
         try: device = self._chosen(DeviceKind.USB)
-        except Exception as exc: self._error(str(exc)); return
+        except Exception:
+            self._error("Aucun téléphone autorisé connecté en USB. Branchez-le et acceptez l’autorisation de débogage."); return
         self._run_async(self._prepare_worker, device, int(self.port.get_value()), self.ip.get_text())
     def _prepare_worker(self, device: AdbDevice, port: int, fallback_ip: str) -> None:
         self.log("INFO", f"Appareil USB détecté : {device.model or device.serial}")
         detected_ip = self.adb.wifi_ip(device.serial)
         self.log("INFO", f"Activation ADB TCP/IP sur le port {port}"); self.adb.enable_tcpip(device.serial, port); time.sleep(2)
-        endpoint = self.adb.connect(detected_ip or fallback_ip, port)
+        target_ip = detected_ip or fallback_ip
+        if not target_ip.strip():
+            raise AdbError("Adresse Wi-Fi introuvable. Vérifiez que le téléphone est connecté au Wi-Fi.")
+        endpoint = self.adb.connect_with_retry(target_ip, port)
         if detected_ip: GLib.idle_add(self.ip.set_text, detected_ip)
         self.log("INFO", f"Connexion à {endpoint} réussie"); self._refresh_worker(); GLib.idle_add(self._save)
 
@@ -269,7 +313,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def _connect_action(self, launch: bool) -> None:
         config = self._read_config(); self._run_async(self._connect_worker, launch, config.ip_address, config.port, config)
     def _connect_worker(self, launch: bool, ip: str, port: int, config: AppConfig) -> None:
-        GLib.idle_add(self.status.set_text, "● Connexion Wi-Fi en cours")
+        GLib.idle_add(self._set_status, "Connexion Wi-Fi en cours", "pending")
         endpoint = self.adb.connect(ip, port); self.log("INFO", f"Connexion à {endpoint} réussie")
         devices = self.adb.devices(); GLib.idle_add(self._show_devices, devices)
         if launch:
@@ -289,12 +333,23 @@ class MainWindow(Gtk.ApplicationWindow):
         self._run_async(self._start_worker, serial, self._read_config())
     def _start_worker(self, device_serial: str, config: AppConfig) -> None:
         self._ignore_scrcpy_geometry = False
-        if config.keep_awake and not self.caps.supports("--stay-awake") and not self.caps.supports("--screen-off-timeout"):
+        guard_applied = False
+        # Old scrcpy versions only provide --stay-awake, which stops working as
+        # soon as the USB cable is removed. Use the recoverable Android timeout
+        # guard for these Wi-Fi sessions as well.
+        if config.keep_awake and not self.caps.supports("--screen-off-timeout"):
             self.guard.apply(device_serial); self.log("INFO", "Délai de veille Android temporairement prolongé.")
-        command = self.scrcpy.start(device_serial, config, self.caps); self.log("INFO", "Commande : " + " ".join(command)); GLib.idle_add(self._scrcpy_started)
+            guard_applied = True
+        try:
+            command = self.scrcpy.start(device_serial, config, self.caps)
+        except Exception:
+            if guard_applied:
+                self.guard.restore()
+            raise
+        self.log("INFO", "Commande : " + " ".join(command)); GLib.idle_add(self._scrcpy_started)
 
     def _scrcpy_started(self) -> bool:
-        self.status.set_text("● scrcpy actif"); self.start_button.set_sensitive(False); self.stop_button.set_sensitive(True); self.phone_profiles.set_sensitive(False)
+        self._set_status("scrcpy actif", "ok"); self.start_button.set_sensitive(False); self.stop_button.set_sensitive(True); self.phone_profiles.set_sensitive(False)
         GLib.timeout_add(750, self._schedule_scrcpy_geometry_capture)
         return False
 
@@ -355,7 +410,7 @@ class MainWindow(Gtk.ApplicationWindow):
         return self.config
 
     def _save(self) -> bool: self.store.save(self._read_config()); return False
-    def _error(self, message: str) -> bool: self.status.set_text("● Erreur"); self.log("ERROR", message); return False
+    def _error(self, message: str) -> bool: self._set_status("Erreur", "error"); self.log("ERROR", message); return False
     def _copy_console(self, _button: Gtk.Button) -> None:
         buffer = self.console.get_buffer(); text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False); Gdk.Display.get_default().get_clipboard().set(text)
     def _on_close(self, _window: Gtk.Window) -> bool:

@@ -7,8 +7,8 @@ from salsilink_control.models import SessionState
 
 
 class FakeAdb:
-    def __init__(self): self.value = "30000"
-    def get_setting(self, serial, key): return self.value
+    def __init__(self): self.value = "30000"; self.get_calls = 0
+    def get_setting(self, serial, key): self.get_calls += 1; return self.value
     def put_setting(self, serial, key, value): self.value = value
 
 
@@ -24,6 +24,13 @@ class SessionTests(unittest.TestCase):
             guard.apply("serial"); self.assertEqual(adb.value, "86400000")
             self.assertTrue(guard.restore()); self.assertEqual(adb.value, "30000")
             self.assertFalse(guard.path.exists())
+
+    def test_reapplying_guard_preserves_original_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            adb = FakeAdb(); guard = SleepTimeoutGuard(adb, Path(directory) / "recovery.json")
+            guard.apply("serial"); guard.apply("serial")
+            self.assertEqual(adb.get_calls, 1)
+            self.assertTrue(guard.restore()); self.assertEqual(adb.value, "30000")
 
 
 if __name__ == "__main__": unittest.main()

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..config import state_dir
 from ..models import SessionState
-from .adb_client import AdbClient
+from .adb_client import AdbClient, AdbError
 
 
 ALLOWED_TRANSITIONS = {
@@ -40,11 +40,21 @@ class SleepTimeoutGuard:
         self.log = log or (lambda _message: None)
 
     def apply(self, serial: str, milliseconds: int = 86_400_000) -> None:
-        previous = self.adb.get_setting(serial, "screen_off_timeout")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"serial": serial, "value": previous}), encoding="utf-8")
-        tmp.replace(self.path)
+        # Never replace the real original value with our own temporary value if
+        # apply() is called twice for the same session.
+        if self.path.exists():
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if str(data.get("serial")) != serial:
+                if not self.restore():
+                    raise AdbError("Impossible de restaurer le délai de veille de l’appareil précédent.")
+        if not self.path.exists():
+            previous = self.adb.get_setting(serial, "screen_off_timeout")
+            if not previous.isdigit():
+                raise AdbError(f"Délai de veille Android illisible : {previous!r}")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"serial": serial, "value": previous}), encoding="utf-8")
+            tmp.replace(self.path)
         self.adb.put_setting(serial, "screen_off_timeout", str(milliseconds))
 
     def restore(self) -> bool:
