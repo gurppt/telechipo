@@ -1,8 +1,15 @@
 # Telechipo
 
-Telechipo est une petite interface GTK4 pour connecter un téléphone Android avec ADB Wi-Fi et lancer scrcpy. Elle gère plusieurs téléphones, mémorise leurs réglages et supervise la fenêtre native de scrcpy.
+Telechipo est une petite interface GTK4 pour connecter un téléphone Android avec ADB Wi-Fi permttant l'affichage sur le bureau et l'intéraction, utilisant scrcpy. Elle gère plusieurs téléphones, mémorise leurs réglages et permet d'empêcher la veille ou éteindre l'écran. Le copier-coller de texte est supporté de l'ordinateur au téléphone.
+
+Application conçu à la base parce que j'en avais marre de répondre aux SMS en tapant sur un clavier minuscule.
 
 <img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/5e8796a5-172b-430d-b59b-856b5c9f1a7e" />
+<br>
+<img width="469" height="526" alt="image" src="https://github.com/user-attachments/assets/a5344406-e976-4578-a3db-2ef3e6a8cceb" />
+<br>
+<img width="471" height="525" alt="image" src="https://github.com/user-attachments/assets/1da27207-4152-471a-adc7-5a6da5c296fb" />
+
 
 
 ## Installation
