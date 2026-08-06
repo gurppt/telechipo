@@ -53,7 +53,11 @@ class SleepTimeoutGuard:
                 raise AdbError(f"Délai de veille Android illisible : {previous!r}")
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"serial": serial, "value": previous}), encoding="utf-8")
+            try:
+                identity = self.adb.device_identity(serial)
+            except Exception:
+                identity = ""
+            tmp.write_text(json.dumps({"serial": serial, "identity": identity, "value": previous}), encoding="utf-8")
             tmp.replace(self.path)
         self.adb.put_setting(serial, "screen_off_timeout", str(milliseconds))
 
@@ -62,10 +66,36 @@ class SleepTimeoutGuard:
             return True
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            self.adb.put_setting(str(data["serial"]), "screen_off_timeout", str(data["value"]))
-            self.path.unlink()
-            self.log("Délai de veille Android restauré.")
-            return True
         except Exception as exc:
-            self.log(f"Impossible de restaurer le délai de veille : {exc}")
+            self.log(f"Impossible de lire la sauvegarde du délai de veille : {exc}")
             return False
+        original_serial = str(data["serial"])
+        candidates = [original_serial]
+        last_error: Exception | None = None
+        try:
+            self.adb.put_setting(original_serial, "screen_off_timeout", str(data["value"]))
+        except Exception as exc:
+            last_error = exc
+            try:
+                devices = [device for device in self.adb.devices() if device.status == "device"]
+                identity = str(data.get("identity", ""))
+                if identity:
+                    devices = [device for device in devices if self.adb.device_identity(device.serial) == identity]
+                elif len(devices) != 1:
+                    devices = []
+                candidates.extend(device.serial for device in devices if device.serial not in candidates)
+            except Exception as discovery_error:
+                last_error = discovery_error
+        for serial in candidates[1:]:
+            try:
+                self.adb.put_setting(serial, "screen_off_timeout", str(data["value"]))
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            self.log(f"Impossible de restaurer le délai de veille : {last_error}")
+            return False
+        self.path.unlink()
+        self.log("Délai de veille Android restauré.")
+        return True

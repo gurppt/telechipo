@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import threading
 import time
 from datetime import datetime
@@ -8,7 +9,7 @@ from typing import Any
 from gi.repository import Gdk, GLib, Gtk
 
 from ..config import ConfigStore
-from ..core.adb_client import AdbClient, AdbError, scan_tcp_subnet
+from ..core.adb_client import AdbClient, AdbError, local_ipv4_networks, scan_tcp_subnet
 from ..core.scrcpy_client import ScrcpyClient
 from ..core.session_manager import SleepTimeoutGuard
 from ..core.window_geometry import X11GeometryController
@@ -44,11 +45,9 @@ class MainWindow(Gtk.ApplicationWindow):
 
         header = Gtk.Box(spacing=6)
         self.title_label = Gtk.Label(label=self.config.phone_name); self.title_label.add_css_class("heading"); self.title_label.set_hexpand(True); self.title_label.set_xalign(0)
-        self.status = Gtk.Label(label="● Non détecté"); self.status.add_css_class("status-error")
-        refresh = Gtk.Button(label="Actualiser"); refresh.connect("clicked", lambda _b: self.refresh())
-        header.append(self.title_label); header.append(self.status); header.append(refresh); root.append(header)
+        header.append(self.title_label); root.append(header)
 
-        tabs = Gtk.Notebook(); tabs.set_vexpand(True); root.append(tabs)
+        tabs = Gtk.Notebook(); root.append(tabs)
         connection = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5); connection.set_margin_top(6); connection.set_margin_bottom(4); connection.set_margin_start(6); connection.set_margin_end(6)
         tabs.append_page(connection, Gtk.Label(label="Connexion"))
         grid = Gtk.Grid(column_spacing=6, row_spacing=4); connection.append(grid)
@@ -67,13 +66,17 @@ class MainWindow(Gtk.ApplicationWindow):
             lab = Gtk.Label(label=label, xalign=0); grid.attach(lab, 0, row, 1, 1); grid.attach(widget, 1, row, 1, 1)
         self.device_dropdown = Gtk.DropDown.new_from_strings(["Aucun appareil"]); grid.attach(Gtk.Label(label="Appareil ADB", xalign=0), 0, 5, 1, 1); grid.attach(self.device_dropdown, 1, 5, 1, 1)
         buttons = Gtk.Box(spacing=4, homogeneous=True); connection.append(buttons)
-        for label, callback in (("Préparer le Wi-Fi depuis USB", self.prepare_wifi), ("Connecter", self.connect_wifi), ("Déconnecter", self.disconnect_wifi)):
-            short_label = "Préparer Wi-Fi" if label.startswith("Préparer") else label
+        for label, callback in (("Activer ADB Wi-Fi depuis USB", self.prepare_wifi), ("Connecter", self.connect_wifi), ("Déconnecter", self.disconnect_wifi)):
+            short_label = "Activer Wi-Fi via USB" if label.startswith("Activer") else label
             button = Gtk.Button(label=short_label); button.set_tooltip_text(label); button.connect("clicked", callback); buttons.append(button)
             if callback == self.prepare_wifi:
                 self.prepare_wifi_button = button
                 button.set_sensitive(False)
-                button.set_tooltip_text("Branchez un téléphone autorisé en USB pour activer ADB Wi-Fi")
+                button.set_tooltip_text("À utiliser après un redémarrage : branchez le téléphone en USB pour activer ADB sur le Wi-Fi")
+        status_row = Gtk.Box(spacing=6); connection.append(status_row)
+        self.status = Gtk.Label(label="● Non détecté", xalign=0); self.status.set_hexpand(True); self.status.add_css_class("status-error")
+        refresh = Gtk.Button(label="Actualiser"); refresh.connect("clicked", lambda _b: self.refresh())
+        status_row.append(self.status); status_row.append(refresh)
         display = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5); display.set_margin_top(6); display.set_margin_bottom(4); display.set_margin_start(6); display.set_margin_end(6)
         tabs.append_page(display, Gtk.Label(label="Affichage"))
         dgrid = Gtk.Grid(column_spacing=6, row_spacing=4); display.append(dgrid)
@@ -121,7 +124,7 @@ class MainWindow(Gtk.ApplicationWindow):
         console_label = Gtk.Label(label="Terminal", xalign=0); console_label.set_hexpand(True); console_header.append(console_label)
         clear = Gtk.Button(label="×"); clear.set_tooltip_text("Effacer"); clear.add_css_class("flat"); clear.connect("clicked", lambda _b: self.console.get_buffer().set_text(""))
         copy = Gtk.Button(label="⧉"); copy.set_tooltip_text("Copier"); copy.add_css_class("flat"); copy.connect("clicked", self._copy_console); console_header.append(clear); console_header.append(copy); root.append(console_header)
-        scroll = Gtk.ScrolledWindow(); scroll.set_min_content_height(150); scroll.set_max_content_height(150); scroll.set_propagate_natural_height(True); scroll.add_css_class("terminal-frame")
+        scroll = Gtk.ScrolledWindow(); scroll.set_min_content_height(150); scroll.set_vexpand(True); scroll.set_propagate_natural_height(True); scroll.add_css_class("terminal-frame")
         self.console = Gtk.TextView(editable=False, cursor_visible=False, monospace=True); self.console.add_css_class("terminal"); self.console.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         buffer = self.console.get_buffer()
         self.log_tags = {
@@ -215,18 +218,24 @@ class MainWindow(Gtk.ApplicationWindow):
     def _show_devices(self, devices: list[AdbDevice]) -> bool:
         self.devices = devices
         labels = [f"{d.model or d.serial} — {d.status} ({d.kind.value})" for d in devices] or ["Aucun appareil"]
-        self.device_dropdown.set_model(Gtk.StringList.new(labels)); self.device_dropdown.set_selected(0)
+        self.device_dropdown.set_model(Gtk.StringList.new(labels))
         authorized = [d for d in devices if d.status == "device"]
         unauthorized = [d for d in devices if d.status == "unauthorized"]
         tcp = [d for d in authorized if d.kind == DeviceKind.TCPIP]
         usb = [d for d in authorized if d.kind == DeviceKind.USB]
-        self.prepare_wifi_button.set_sensitive(bool(usb))
-        if usb:
+        preferred_mode = self.mode.get_selected_item().get_string()
+        preferred = tcp if preferred_mode in ("Automatique", "Wi-Fi") else usb
+        preferred_device = preferred[0] if preferred else (authorized[0] if authorized else None)
+        self.device_dropdown.set_selected(devices.index(preferred_device) if preferred_device else 0)
+        self.prepare_wifi_button.set_sensitive(bool(usb) and not bool(tcp))
+        if tcp:
+            self.prepare_wifi_button.set_tooltip_text("ADB Wi-Fi est déjà actif : utilisez Afficher, ou Connecter après une déconnexion")
+        elif usb:
             self.prepare_wifi_button.set_tooltip_text("Activer ADB Wi-Fi depuis le téléphone USB sélectionné")
         elif unauthorized:
             self.prepare_wifi_button.set_tooltip_text("Déverrouillez le téléphone et acceptez l’autorisation de débogage USB")
         else:
-            self.prepare_wifi_button.set_tooltip_text("Branchez un téléphone autorisé en USB pour activer ADB Wi-Fi")
+            self.prepare_wifi_button.set_tooltip_text("À utiliser après un redémarrage : branchez le téléphone en USB pour activer ADB sur le Wi-Fi")
         if tcp: text, state = "Connecté en Wi-Fi", "ok"
         elif usb: text, state = "Connecté en USB", "ok"
         elif unauthorized: text, state = "USB non autorisé", "error"
@@ -289,6 +298,12 @@ class MainWindow(Gtk.ApplicationWindow):
     def _chosen(self, kind: DeviceKind | None = None) -> AdbDevice:
         candidates = [d for d in self.devices if d.status == "device" and (kind is None or d.kind == kind)]
         if not candidates: raise AdbError("Aucun appareil autorisé correspondant.")
+        if kind is None:
+            preferred_mode = self.mode.get_selected_item().get_string()
+            preferred_kind = DeviceKind.TCPIP if preferred_mode in ("Automatique", "Wi-Fi") else DeviceKind.USB
+            preferred = [device for device in candidates if device.kind == preferred_kind]
+            if len(preferred) == 1:
+                return preferred[0]
         selected = self.device_dropdown.get_selected()
         if selected < len(self.devices) and self.devices[selected] in candidates: return self.devices[selected]
         if len(candidates) == 1: return candidates[0]
@@ -298,27 +313,52 @@ class MainWindow(Gtk.ApplicationWindow):
         try: device = self._chosen(DeviceKind.USB)
         except Exception:
             self._error("Aucun téléphone autorisé connecté en USB. Branchez-le et acceptez l’autorisation de débogage."); return
-        self._run_async(self._prepare_worker, device, int(self.port.get_value()), self.ip.get_text())
-    def _prepare_worker(self, device: AdbDevice, port: int, fallback_ip: str) -> None:
-        self.log("INFO", f"Appareil USB détecté : {device.model or device.serial}")
-        detected_ip = self.adb.wifi_ip(device.serial)
-        self.log("INFO", f"Activation ADB TCP/IP sur le port {port}"); self.adb.enable_tcpip(device.serial, port); time.sleep(2)
-        target_ip = detected_ip or fallback_ip
-        if not target_ip.strip():
-            raise AdbError("Adresse Wi-Fi introuvable. Vérifiez que le téléphone est connecté au Wi-Fi.")
-        endpoint = self.adb.connect_with_retry(target_ip, port)
-        identity = self.adb.device_identity(endpoint)
-        if detected_ip: GLib.idle_add(self.ip.set_text, detected_ip)
-        GLib.idle_add(self._remember_device_identity, self.config.active_profile_id, identity)
-        self.log("INFO", f"Connexion à {endpoint} réussie"); self._refresh_worker(); GLib.idle_add(self._save)
+        self.prepare_wifi_button.set_sensitive(False)
+        self._set_status("Vérification Wi-Fi…", "pending")
+        self._run_async(self._prepare_worker, device, int(self.port.get_value()), self.config.active_profile_id)
+    def _prepare_worker(self, device: AdbDevice, port: int, profile_id: str) -> None:
+        try:
+            self.log("INFO", f"Appareil USB détecté : {device.model or device.serial}")
+            detected_ip = self._validated_phone_wifi(device.serial)
+            self.log("INFO", f"Activation ADB TCP/IP sur le port {port}"); self.adb.enable_tcpip(device.serial, port); time.sleep(2)
+            endpoint = self.adb.connect_with_retry(detected_ip, port)
+            identity = self.adb.device_identity(endpoint)
+            GLib.idle_add(self.ip.set_text, detected_ip)
+            GLib.idle_add(self._remember_device_identity, profile_id, identity)
+            self.log("INFO", f"Connexion à {endpoint} réussie"); self._refresh_worker(); GLib.idle_add(self._save)
+        finally:
+            GLib.idle_add(self._prepare_finished)
+
+    def _prepare_finished(self) -> bool:
+        usb_ready = any(device.status == "device" and device.kind == DeviceKind.USB for device in self.devices)
+        wifi_ready = any(device.status == "device" and device.kind == DeviceKind.TCPIP for device in self.devices)
+        self.prepare_wifi_button.set_sensitive(usb_ready and not wifi_ready)
+        return False
 
     def discover_wifi(self, _button: Gtk.Button) -> None:
         config = self._read_config()
         profile = config.active_profile
+        usb = [device for device in self.devices if device.status == "device" and device.kind == DeviceKind.USB]
+        usb_serial = usb[0].serial if len(usb) == 1 else None
         self._set_status("Détection réseau…", "pending")
-        self._run_async(self._discover_worker, profile.id, profile.ip_address, profile.port, profile.device_identity)
+        self._run_async(self._discover_worker, profile.id, profile.ip_address, profile.port, profile.device_identity, usb_serial)
 
-    def _discover_worker(self, profile_id: str, previous_ip: str, port: int, expected_identity: str) -> None:
+    def _validated_phone_wifi(self, serial: str) -> str:
+        self.log("INFO", "Vérification système — recherche d’une adresse IPv4 portée par l’interface Wi-Fi du téléphone.")
+        detected_ip = self.adb.wifi_ip(serial)
+        if not detected_ip:
+            raise AdbError("Le téléphone n’est pas connecté au Wi-Fi. Activez le Wi-Fi et connectez-le au même réseau que cet ordinateur.")
+        networks = local_ipv4_networks()
+        if networks and not any(ipaddress.ip_address(detected_ip) in network for network in networks):
+            local_text = ", ".join(str(network) for network in networks)
+            raise AdbError(f"Le téléphone ({detected_ip}) n’est pas sur le même réseau local que cet ordinateur ({local_text}).")
+        self.log("INFO", f"Vérification système réussie — adresse Wi-Fi locale : {detected_ip}.")
+        return detected_ip
+
+    def _discover_worker(self, profile_id: str, previous_ip: str, port: int, expected_identity: str, usb_serial: str | None = None) -> None:
+        if usb_serial:
+            self.log("INFO", "Téléphone USB présent — contrôle du Wi-Fi avant la découverte réseau.")
+            previous_ip = self._validated_phone_wifi(usb_serial)
         self.log("INFO", "Détection Wi-Fi — étape 1/4 : détermination du réseau depuis la dernière adresse connue.")
         network, hosts = scan_tcp_subnet(
             previous_ip,
@@ -421,7 +461,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._capture_scrcpy_geometry_worker()
         self.scrcpy.stop()
     def _scrcpy_exited(self, code: int) -> bool:
-        self.guard.restore(); self.log("INFO" if code == 0 else "WARNING", f"scrcpy fermé (code {code}), délai de veille restauré")
+        restored = self.guard.restore()
+        suffix = "délai de veille restauré" if restored else "restauration du délai de veille en attente d’une reconnexion"
+        self.log("INFO" if code == 0 and restored else "WARNING", f"scrcpy fermé (code {code}), {suffix}")
         self.store.save(self._read_config())
         self.stop_button.set_sensitive(False); self.start_button.set_sensitive(True); self.phone_profiles.set_sensitive(True); self.refresh(); return False
 

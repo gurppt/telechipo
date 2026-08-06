@@ -1,7 +1,10 @@
 import unittest
 from unittest.mock import patch
 
-from salsilink_control.core.adb_client import AdbClient, AdbError, parse_devices, scan_tcp_subnet, validate_endpoint
+from salsilink_control.core.adb_client import (
+    AdbClient, AdbError, parse_devices, parse_local_ipv4_networks,
+    parse_wifi_ipv4, scan_tcp_subnet, validate_endpoint,
+)
 from salsilink_control.models import DeviceKind
 
 
@@ -24,6 +27,18 @@ third offline usb:1-3
         self.assertEqual(validate_endpoint("192.0.2.10", 5555), "192.0.2.10:5555")
         with self.assertRaises(AdbError): validate_endpoint("hello; reboot", 5555)
         with self.assertRaises(AdbError): validate_endpoint("127.0.0.1", 99999)
+
+    def test_wifi_ip_excludes_mobile_interfaces(self):
+        output = """1: lo    inet 127.0.0.1/8 scope host lo
+12: rmnet_data0    inet 10.28.9.54/30 scope global rmnet_data0
+21: wlan0    inet 192.168.1.80/24 brd 192.168.1.255 scope global wlan0
+"""
+        self.assertEqual(parse_wifi_ipv4(output), ["192.168.1.80"])
+        self.assertEqual(parse_wifi_ipv4(output.replace("wlan0", "rmnet_data1")), [])
+
+    def test_local_network_parsing(self):
+        output = "2: enp4s0 inet 192.168.1.22/24 brd 192.168.1.255 scope global enp4s0\n"
+        self.assertEqual([str(network) for network in parse_local_ipv4_networks(output)], ["192.168.1.0/24"])
 
     @patch("salsilink_control.core.adb_client.time.sleep")
     def test_connect_retries_while_adbd_restarts(self, sleep):

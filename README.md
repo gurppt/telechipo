@@ -65,9 +65,9 @@ Pour préparer un téléphone la première fois :
 2. branchez et déverrouillez le téléphone ;
 3. acceptez l’autorisation ADB ;
 4. créez ou sélectionnez son profil dans Telechipo ;
-5. cliquez sur **Préparer Wi-Fi**.
+5. cliquez sur **Activer Wi-Fi via USB**.
 
-Vous pouvez ensuite retirer le câble. Tant qu’ADB TCP/IP reste actif et que l’adresse du téléphone ne change pas, utilisez **Connecter**, puis **Afficher**. Une réservation DHCP est recommandée. Après un redémarrage complet du téléphone, il peut être nécessaire de refaire la préparation USB.
+Vous pouvez ensuite retirer le câble. Tant qu’ADB TCP/IP reste actif et que l’adresse du téléphone ne change pas, utilisez **Connecter**, puis **Afficher**. Le bouton **Activer Wi-Fi via USB** sert uniquement à réactiver ADB Wi-Fi depuis un câble USB, notamment après un redémarrage complet du téléphone ; il ne sert pas à établir une connexion Wi-Fi déjà préparée. Une réservation DHCP est recommandée.
 
 Chaque profil conserve son adresse, son port, ses réglages vidéo et la géométrie de sa fenêtre scrcpy. Telechipo détecte dynamiquement les options disponibles afin de fonctionner avec les anciennes et nouvelles versions de scrcpy.
 

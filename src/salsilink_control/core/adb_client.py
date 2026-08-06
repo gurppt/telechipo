@@ -16,6 +16,42 @@ class AdbError(RuntimeError):
     pass
 
 
+WIFI_INTERFACE_RE = re.compile(r"^(?:wlan|wifi|swlan)\d*$", re.I)
+
+
+def parse_wifi_ipv4(output: str) -> list[str]:
+    """Extract IPv4 addresses carried by Android Wi-Fi interfaces only."""
+    addresses: list[str] = []
+    for line in output.splitlines():
+        match = re.search(r"^\d+:\s+([^\s:]+)(?:\s+|[^\s]*\s+)inet\s+(\d+(?:\.\d+){3})/", line.strip())
+        if not match or not WIFI_INTERFACE_RE.match(match.group(1)):
+            continue
+        address = ipaddress.ip_address(match.group(2))
+        if not address.is_loopback and not address.is_link_local:
+            addresses.append(str(address))
+    return addresses
+
+
+def parse_local_ipv4_networks(output: str) -> list[ipaddress.IPv4Network]:
+    networks: list[ipaddress.IPv4Network] = []
+    for match in re.finditer(r"\binet\s+(\d+(?:\.\d+){3}/\d+)\b", output):
+        interface = ipaddress.ip_interface(match.group(1))
+        if interface.version == 4 and not interface.ip.is_loopback and not interface.ip.is_link_local:
+            networks.append(interface.network)
+    return networks
+
+
+def local_ipv4_networks() -> list[ipaddress.IPv4Network]:
+    binary = shutil.which("ip")
+    if not binary:
+        return []
+    result = subprocess.run(
+        [binary, "-o", "-4", "addr", "show", "scope", "global"],
+        capture_output=True, text=True, timeout=4, check=False,
+    )
+    return parse_local_ipv4_networks(result.stdout)
+
+
 def parse_devices(output: str) -> list[AdbDevice]:
     devices: list[AdbDevice] = []
     for line in output.splitlines():
@@ -136,9 +172,9 @@ class AdbClient:
         self.run(["tcpip", str(port)], serial=serial, timeout=18)
 
     def wifi_ip(self, serial: str) -> str | None:
-        output = self.run(["shell", "ip", "-f", "inet", "addr", "show", "wlan0"], serial=serial)
-        match = re.search(r"\binet\s+(\d+(?:\.\d+){3})/", output)
-        return match.group(1) if match else None
+        output = self.run(["shell", "ip", "-o", "-4", "addr", "show"], serial=serial)
+        addresses = parse_wifi_ipv4(output)
+        return addresses[0] if addresses else None
 
     def device_identity(self, serial: str) -> str:
         identity = self.run(["shell", "getprop", "ro.serialno"], serial=serial).strip()
